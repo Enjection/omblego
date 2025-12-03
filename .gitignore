@@ -1,0 +1,18 @@
+# Binary
+omblego
+omblego.exe
+
+# Output files
+*.csv
+ubpm.json
+backup_*.csv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
