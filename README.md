@@ -121,23 +121,38 @@ outputs:
       bucket: health
 ```
 
-## Output Formats
+## Output Sinks
 
-### CSV (user1.csv, user2.csv)
+| Type | Description |
+|------|-------------|
+| `csv` | CSV files per user (`user1.csv`, `user2.csv`) |
+| `json` | JSON file compatible with ubpm format |
+| `influxdb` | InfluxDB v2 time-series database |
+| `webhook` | HTTP POST to custom endpoint |
+| `database` | SQL database (PostgreSQL, MySQL, SQLite) |
+| `script` | Execute external command with record data |
+| `prometheus` | Prometheus metrics endpoint |
 
-```csv
-datetime,dia,sys,bpm,mov,ihb
-2024-01-15 08:30:00,80,120,72,0,0
-```
+Example config with multiple sinks:
 
-### JSON (ubpm.json)
-
-```json
-{
-    "UBPM": {
-        "U1": [{"date": "15.01.2024", "time": "08:30:00", "sys": 120, "dia": 80, "bpm": 72}]
-    }
-}
+```yaml
+outputs:
+  - type: csv
+    enabled: true
+    settings:
+      directory: ~/.omblego/data
+  - type: influxdb
+    enabled: true
+    settings:
+      url: http://localhost:8086
+      token: ${INFLUXDB_TOKEN}
+      org: personal
+      bucket: health
+  - type: webhook
+    enabled: true
+    settings:
+      url: https://api.example.com/bp
+      method: POST
 ```
 
 ## Troubleshooting
