@@ -28,7 +28,14 @@ Requirements:
 
 ## Quick Start
 
-### 1. Pair your device
+### 1. Discover your device
+
+```bash
+omblego list-devices          # Show supported models
+omblego scan                  # Find nearby devices
+```
+
+### 2. Pair (first time only)
 
 Put device in pairing mode (hold Bluetooth button until -P- displays):
 
@@ -36,11 +43,53 @@ Put device in pairing mode (hold Bluetooth button until -P- displays):
 omblego pair -d BP7000 --interactive
 ```
 
-### 2. Sync records
+### 3. Test sync
 
 ```bash
-omblego sync -d BP7000 --auto
+omblego sync -d BP7000
 ```
+
+### 4. Setup daemon
+
+Create `~/.config/omblego/config.yaml`:
+
+```yaml
+device:
+  model: BP7000
+  uuid: auto                    # auto-captured from pairing
+
+daemon:
+  interval: 3h
+  time_sync: true
+
+logging:
+  level: info
+  output: stderr
+
+outputs:
+  - type: csv
+    enabled: true
+    settings:
+      directory: ~/.omblego/data
+
+  - type: influxdb
+    enabled: false
+    settings:
+      url: http://localhost:8086
+      token: ${INFLUXDB_TOKEN}
+      org: personal
+      bucket: health
+```
+
+Run daemon:
+
+```bash
+omblego daemon                # uses config file
+# or manually:
+omblego daemon -d BP7000 --interval 3h
+```
+
+Signals: `SIGHUP` = force sync, `SIGTERM` = graceful shutdown
 
 ## Commands
 
