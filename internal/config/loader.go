@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/knadh/koanf/parsers/yaml"
@@ -13,9 +14,26 @@ import (
 	"github.com/knadh/koanf/v2"
 )
 
+// DefaultUserConfigPath returns the default user config path
+func DefaultUserConfigPath() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".config", "omblego", "config.yaml")
+	}
+	return ""
+}
+
+// DefaultSystemConfigPath returns the system-wide config path
+func DefaultSystemConfigPath() string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(os.Getenv("ProgramData"), "omblego", "config.yaml")
+	}
+	return "/etc/omblego/config.yaml"
+}
+
 // Loader handles configuration loading from multiple sources
 type Loader struct {
-	k *koanf.Koanf
+	k          *koanf.Koanf
+	loadedFrom string
 }
 
 // NewLoader creates a new configuration loader
@@ -25,10 +43,20 @@ func NewLoader() *Loader {
 	}
 }
 
+// LoadedFrom returns the path of the config file that was loaded
+func (l *Loader) LoadedFrom() string {
+	return l.loadedFrom
+}
+
 // Load loads configuration with the following precedence (highest to lowest):
 // 1. Environment variables (OMBLEGO_*)
 // 2. Config file (explicit path or default locations)
 // 3. Default values
+//
+// Config file search order:
+//  1. Explicit path (if provided)
+//  2. User config: ~/.config/omblego/config.yaml
+//  3. System config: /etc/omblego/config.yaml
 //
 // CLI flags should be applied after Load() by calling ApplyOverrides.
 func (l *Loader) Load(configPath string) (*Config, error) {
@@ -50,6 +78,8 @@ func (l *Loader) Load(configPath string) (*Config, error) {
 				return nil, fmt.Errorf("failed to load config file %s: %w", path, err)
 			}
 			// Silently ignore if auto-discovered file fails
+		} else {
+			l.loadedFrom = path
 		}
 	}
 
@@ -84,23 +114,20 @@ func LoadDefault() (*Config, error) {
 	return loader.Load("")
 }
 
-// findConfigFile searches for config in standard locations
+// findConfigFile searches for config in standard locations.
+// Search order (first found wins):
+//  1. User config: ~/.config/omblego/config.yaml
+//  2. System config: /etc/omblego/config.yaml
 func (l *Loader) findConfigFile() string {
 	locations := []string{
-		"./omblego.yaml",
-		"./omblego.yml",
-	}
-
-	if home, err := os.UserHomeDir(); err == nil {
-		locations = append(locations,
-			filepath.Join(home, ".config", "omblego", "config.yaml"),
-			filepath.Join(home, ".config", "omblego", "config.yml"),
-			filepath.Join(home, ".omblego.yaml"),
-			filepath.Join(home, ".omblego.yml"),
-		)
+		DefaultUserConfigPath(),
+		DefaultSystemConfigPath(),
 	}
 
 	for _, loc := range locations {
+		if loc == "" {
+			continue
+		}
 		if _, err := os.Stat(loc); err == nil {
 			return loc
 		}
@@ -128,18 +155,15 @@ func (l *Loader) Unmarshal(path string, o interface{}) error {
 	return l.k.Unmarshal(path, o)
 }
 
-// ConfigPaths returns the default config file search paths
+// ConfigPaths returns the default config file search paths in priority order
 func ConfigPaths() []string {
-	paths := []string{
-		"./omblego.yaml",
-		"./omblego.yml",
-	}
+	paths := []string{}
 
-	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths,
-			filepath.Join(home, ".config", "omblego", "config.yaml"),
-			filepath.Join(home, ".config", "omblego", "config.yml"),
-		)
+	if p := DefaultUserConfigPath(); p != "" {
+		paths = append(paths, p)
+	}
+	if p := DefaultSystemConfigPath(); p != "" {
+		paths = append(paths, p)
 	}
 
 	return paths

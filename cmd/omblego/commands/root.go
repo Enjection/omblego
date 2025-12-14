@@ -62,7 +62,9 @@ func init() {
 	cobra.OnInitialize(initConfig)
 
 	// Global flags
-	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "Config file path (default: $HOME/.config/omblego/config.yaml)")
+	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "",
+		fmt.Sprintf("Config file path\n  Search order: 1) explicit path 2) %s 3) %s",
+			config.DefaultUserConfigPath(), config.DefaultSystemConfigPath()))
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug mode")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error, off")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text, json")

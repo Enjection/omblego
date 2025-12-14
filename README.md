@@ -84,7 +84,12 @@ Signals:
 
 ## Configuration
 
-Create `~/.config/omblego/config.yaml`:
+Config file search order:
+1. Explicit path: `omblego --config /path/to/config.yaml`
+2. User config: `~/.config/omblego/config.yaml`
+3. System config: `/etc/omblego/config.yaml`
+
+Example `~/.config/omblego/config.yaml`:
 
 ```yaml
 device:

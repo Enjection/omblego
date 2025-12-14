@@ -199,8 +199,13 @@ func TestConfigPaths(t *testing.T) {
 		t.Errorf("Expected at least 2 paths, got %d", len(paths))
 	}
 
-	// First paths should be local
-	if paths[0] != "./omblego.yaml" {
-		t.Errorf("Expected first path to be ./omblego.yaml, got %s", paths[0])
+	// First path should be user config
+	if paths[0] != config.DefaultUserConfigPath() {
+		t.Errorf("Expected first path to be user config %s, got %s", config.DefaultUserConfigPath(), paths[0])
+	}
+
+	// Second path should be system config
+	if paths[1] != config.DefaultSystemConfigPath() {
+		t.Errorf("Expected second path to be system config %s, got %s", config.DefaultSystemConfigPath(), paths[1])
 	}
 }
