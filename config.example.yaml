@@ -82,6 +82,9 @@ outputs:
       table: blood_pressure
       batch_size: 50
       retry_count: 3
+      # PostgreSQL example with env variable:
+      # driver: postgres
+      # dsn: "postgres://user:${POSTGRES_PASSWORD}@localhost:5432/health?sslmode=disable"
 
   # Script execution output
   - type: script
