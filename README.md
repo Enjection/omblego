@@ -196,6 +196,57 @@ Protocol types:
 - `ProtocolOmronCustom`: EEPROM-based (HEM-* devices)
 - `ProtocolStandardGATT`: Standard BLE Blood Pressure Service (BP5250)
 
+## Adding New Output Sinks
+
+1. Create backend in `internal/output/mybackend.go`:
+
+```go
+type MyBackend struct {
+    name string
+    // your config fields
+}
+
+func NewMyBackend(name string, settings map[string]interface{}) (*MyBackend, error) {
+    // parse settings, validate config
+    return &MyBackend{name: name}, nil
+}
+
+func (b *MyBackend) Name() string { return b.name }
+func (b *MyBackend) Type() string { return "mybackend" }
+
+func (b *MyBackend) Write(ctx context.Context, records [][]Record, meta Metadata) error {
+    for userIdx, userRecords := range records {
+        for _, rec := range userRecords {
+            // write rec.Systolic, rec.Diastolic, rec.Pulse, rec.Timestamp, etc.
+        }
+    }
+    return nil
+}
+
+func (b *MyBackend) Health(ctx context.Context) error { return nil }
+func (b *MyBackend) Close() error { return nil }
+```
+
+2. Register in `internal/output/factory.go`:
+
+```go
+func init() {
+    Register("mybackend", func(name string, settings map[string]interface{}) (Backend, error) {
+        return NewMyBackend(name, settings)
+    })
+}
+```
+
+3. Use in config:
+
+```yaml
+outputs:
+  - type: mybackend
+    enabled: true
+    settings:
+      my_option: value
+```
+
 ## Credits
 
 - Original: [omblepy](https://github.com/userx14/omblepy) by userx14
