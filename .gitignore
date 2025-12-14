@@ -1,6 +1,6 @@
 # Binary
-omblego
-omblego.exe
+/omblego
+/omblego.exe
 
 # Output files
 *.csv

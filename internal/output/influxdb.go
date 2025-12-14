@@ -134,7 +134,8 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// TrackSentRecords keeps track of which records have been sent
+// SentTracker keeps track of which records have been sent (in-memory)
+// Note: InfluxDB deduplicates points with same timestamp+tags automatically
 type SentTracker struct {
 	lastSentTimestamp time.Time
 }

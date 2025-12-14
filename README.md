@@ -1,96 +1,119 @@
 # omblego
 
-Cross-platform CLI tool to read blood pressure records from Omron Bluetooth LE devices.
+CLI tool to read blood pressure records from Omron Bluetooth LE devices.
 
 Go rewrite of [omblepy](https://github.com/userx14/omblepy) with macOS support.
 
-## Platform Support
-
-| OS | Status | Notes |
-|----|--------|-------|
-| macOS | Supported | CoreBluetooth (requires Xcode) |
-| Linux | Supported | BlueZ |
-| Windows | Experimental | WinRT |
-
 ## Supported Devices
 
+- BP7000, BP5250, EVOLV
 - HEM-7322T (M700 Intelli IT)
 - HEM-7600T (Omron Evolv)
 - HEM-6232T (wrist monitor)
 - HEM-7530T (Omron Complete)
-- HEM-7155T (M400/M4/X4 smart)
-- HEM-7150T (BP7250)
-- HEM-7342T (BP7450)
-- HEM-7361T (M500/M7 Intelli IT)
+- HEM-7155T, HEM-7150T, HEM-7342T, HEM-7361T
 
 ## Installation
 
-### From Source
-
 ```bash
-# Requires Go 1.21+
 git clone <repo-url>
 cd omblego
 go build -o omblego ./cmd/omblego
 ```
 
-### macOS Requirements
+Requirements:
+- Go 1.21+
+- macOS: Xcode (for CoreBluetooth)
+- Linux: BlueZ (`apt install bluez`)
 
-- Xcode (for CoreBluetooth CGo bindings)
-- Bluetooth permission in System Preferences
+## Quick Start
 
-## Usage
+### 1. Pair your device
 
-### First-Time Pairing
-
-Put your Omron device in pairing mode (hold Bluetooth button until `-P-` displays):
-
-```bash
-omblego -d HEM-7322T -p
-```
-
-Accept any OS Bluetooth pairing dialogs when prompted.
-
-### Reading Records
-
-After pairing, read records without the `-p` flag:
+Put device in pairing mode (hold Bluetooth button until -P- displays):
 
 ```bash
-omblego -d HEM-7322T
+omblego pair -d BP7000 --interactive
 ```
 
-### Options
-
-```
--d, --device string   Device model name (required)
--m, --mac string      Bluetooth MAC address (skip device scan)
--p, --pair            Enable pairing mode (first-time setup)
--n, --newRecOnly      Only read new/unread records
--t, --timeSync        Synchronize device time with system
--o, --output string   Output format: csv, json, or both (default: csv)
-    --debug           Enable debug logging
-```
-
-### Examples
+### 2. Sync records
 
 ```bash
-# Pair a new device
-omblego -d HEM-7322T -p
+omblego sync -d BP7000 --auto
+```
 
-# Read all records to CSV
-omblego -d HEM-7322T
+## Commands
 
-# Read only new records with time sync
-omblego -d HEM-7322T -n -t
+```
+omblego pair          Pair with a new device
+omblego sync          Sync blood pressure records
+omblego daemon        Run as daemon (periodic sync)
+omblego scan          Scan for nearby devices
+omblego list-devices  List supported devices
+omblego version       Print version
+```
 
-# Output both CSV and JSON
-omblego -d HEM-7322T -o both
+### Pair
 
-# Skip device scan with known MAC address
-omblego -d HEM-7322T -m "AA:BB:CC:DD:EE:FF"
+```bash
+omblego pair -d BP7000 --interactive     # Scan and select device
+omblego pair -d BP7000 --mac AA:BB:CC:DD:EE:FF
+```
 
-# List supported devices
-omblego list-devices
+### Sync
+
+```bash
+omblego sync -d BP7000 --auto            # Wait for device (macOS)
+omblego sync -d BP7000 --auto --time-sync
+omblego sync -d BP7000 --auto --new-only
+omblego sync -d BP7000 --uuid <device-uuid>
+omblego sync -d BP7000 -o json           # Output format: csv, json, both
+```
+
+### Daemon
+
+```bash
+omblego daemon -d BP7000 --interval 3h
+omblego daemon -d BP7000 --interval 3h --influx-url http://localhost:8086 \
+  --influx-token TOKEN --influx-org myorg --influx-bucket health
+```
+
+Signals:
+- SIGHUP: Force immediate sync
+- SIGTERM/SIGINT: Graceful shutdown
+
+## Configuration
+
+Create `~/.config/omblego/config.yaml`:
+
+```yaml
+device:
+  model: BP7000
+  uuid: auto
+
+daemon:
+  interval: 3h
+  time_sync: true
+
+logging:
+  level: info
+  format: text
+  output: stderr
+
+outputs:
+  - type: csv
+    enabled: true
+    settings:
+      directory: "."
+      file_pattern: "user{user}.csv"
+
+  - type: influxdb
+    enabled: false
+    settings:
+      url: http://localhost:8086
+      token: ${INFLUXDB_TOKEN}
+      org: personal
+      bucket: health
 ```
 
 ## Output Formats
@@ -100,54 +123,77 @@ omblego list-devices
 ```csv
 datetime,dia,sys,bpm,mov,ihb
 2024-01-15 08:30:00,80,120,72,0,0
-2024-01-16 07:45:30,82,125,68,1,0
 ```
 
-### JSON (ubpm.json) - UBPM Compatible
+### JSON (ubpm.json)
 
 ```json
 {
     "UBPM": {
-        "U1": [
-            {
-                "date": "15.01.2024",
-                "time": "08:30:00",
-                "sys": 120,
-                "dia": 80,
-                "bpm": 72,
-                "ihb": 0,
-                "mov": 0
-            }
-        ]
+        "U1": [{"date": "15.01.2024", "time": "08:30:00", "sys": 120, "dia": 80, "bpm": 72}]
     }
 }
 ```
 
 ## Troubleshooting
 
-### macOS
+**macOS:**
+- Grant Bluetooth permission to Terminal
+- If pairing fails, remove device from System Preferences > Bluetooth first
 
-- Ensure Bluetooth is enabled in System Preferences
-- Grant Bluetooth permission to Terminal/iTerm
-- If pairing fails, remove the device from System Preferences > Bluetooth first
+**Linux:**
+- May need sudo for Bluetooth access
+- Ensure BlueZ is installed
 
-### Linux
+## Adding New Devices
 
-- Ensure BlueZ is installed: `apt install bluez`
-- May need to run with sudo for Bluetooth access
-- For multi-adapter systems, see [omblepy documentation](https://github.com/userx14/omblepy)
+1. Add driver in `internal/device/devices/devices.go`:
 
-### Windows
+```go
+type MyDevice struct {
+    config device.Config
+}
 
-- Requires Windows 10/11 with Bluetooth 4.2+
-- WinRT support is experimental
+func NewMyDevice() device.Driver {
+    return &MyDevice{
+        config: device.Config{
+            Name:                  "MY-DEVICE",
+            Protocol:              device.ProtocolOmronCustom, // or ProtocolStandardGATT
+            BLENamePrefix:         "BLEsmart_00000XXX",
+            Endianness:            device.BigEndian,
+            UserStartAddresses:    []uint16{0x02ac},
+            RecordsPerUser:        []int{100},
+            RecordByteSize:        0x0e,
+            TransmissionBlockSize: 0x38,
+            // ... other config
+        },
+    }
+}
+
+func (d *MyDevice) GetConfig() device.Config { return d.config }
+func (d *MyDevice) ParseRecord(data []byte) (*device.BloodPressureRecord, error) {
+    // Parse device-specific record format
+}
+func (d *MyDevice) BuildTimeSyncBytes(settings []byte, t time.Time) ([]byte, error) {
+    // Build time sync payload
+}
+```
+
+2. Register in `init()`:
+
+```go
+func init() {
+    device.Register("my-device", NewMyDevice)
+}
+```
+
+Protocol types:
+- `ProtocolOmronCustom`: EEPROM-based (HEM-* devices)
+- `ProtocolStandardGATT`: Standard BLE Blood Pressure Service (BP5250)
 
 ## Credits
 
-- Original Python implementation: [omblepy](https://github.com/userx14/omblepy) by userx14
-- UBPM protocol research: [LazyT/ubpm](https://codeberg.org/LazyT/ubpm)
-- BLE library: [tinygo-org/bluetooth](https://github.com/tinygo-org/bluetooth)
-
-## License
-
-Same as omblepy (check original repository for license terms).
+- Original: [omblepy](https://github.com/userx14/omblepy) by userx14
+- Protocol: [LazyT/ubpm](https://codeberg.org/LazyT/ubpm)
+- Protocol reference: [StanfordSpezi/SpeziDevices](https://github.com/StanfordSpezi/SpeziDevices)
+- BLE: [tinygo-org/bluetooth](https://github.com/tinygo-org/bluetooth)
