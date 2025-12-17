@@ -1,6 +1,7 @@
 # Binary
 /omblego
 /omblego.exe
+bin/*
 
 # Output files
 *.csv

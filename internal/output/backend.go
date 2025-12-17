@@ -38,6 +38,7 @@ type Metadata struct {
 	SyncTimestamp time.Time // When the sync was performed
 	IsFullSync    bool      // true if full sync, false if incremental
 	SessionID     string    // Unique ID for this sync session
+	BatteryLevel  *uint8    // Battery level percentage (nil if not available)
 }
 
 // RetryableBackend is an optional interface for backends that support retries

@@ -19,58 +19,47 @@ import (
 )
 
 var (
-	daemonDeviceName  string
-	daemonDeviceUUID  string
-	daemonInterval    time.Duration
-	daemonTimeSync    bool
-	daemonInfluxURL   string
-	daemonInfluxToken string
-	daemonInfluxOrg   string
-	daemonInfluxBucket string
+	daemonDeviceName string
+	daemonDeviceUUID string
+	daemonTimeSync   bool
+	daemonUseEEPROM  bool
 )
 
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
-	Short: "Run as a daemon, syncing on interval",
-	Long: `Runs omblego as a daemon that periodically syncs blood pressure records.
+	Short: "Run as a daemon, syncing when device connects",
+	Long: `Runs omblego as a daemon that syncs blood pressure records.
 
-The daemon will:
-- Wait for the device to connect
-- Read all records
-- Push new records to InfluxDB (if configured)
-- Save records to CSV
-- Repeat at the configured interval
+The daemon syncs blood pressure records whenever the Omron device advertises.
+The device advertises when:
+1. User presses the Bluetooth button
+2. User takes a new measurement (device auto-advertises for ~60 seconds)
+
+How it works:
+1. Daemon waits passively for device to advertise (energy-efficient)
+2. When device advertises, daemon checks the sequence number in advertisement data
+3. If sequence number changed: connect and sync new records
+4. If sequence number unchanged: skip sync (no new data)
+
+This approach avoids unnecessary syncs by checking the advertisement data
+before connecting - the same technique used by the SpeziDevices Swift library.
+
+Output backends (CSV, InfluxDB, Prometheus, etc.) are configured via config file.
 
 Signals:
-- SIGHUP: Force an immediate sync (bypass interval wait)
 - SIGTERM/SIGINT: Graceful shutdown
 
 Examples:
-  # Run daemon with 3-hour sync interval
-  omblego daemon -d BP7000 --interval 3h
-
-  # Daemon with InfluxDB output
-  omblego daemon -d BP7000 --interval 3h \
-    --influx-url http://localhost:8086 \
-    --influx-token YOUR_TOKEN \
-    --influx-org myorg --influx-bucket health
-
-  # Force sync with signal (from another terminal)
-  kill -HUP $(pgrep omblego)`,
+  # Run daemon with config file
+  omblego daemon -d BP7000 --config ~/.config/omblego/config.yaml`,
 	RunE: runDaemon,
 }
 
 func init() {
 	daemonCmd.Flags().StringVarP(&daemonDeviceName, "device", "d", "", "Device model name (e.g., BP7000)")
 	daemonCmd.Flags().StringVar(&daemonDeviceUUID, "uuid", "", "Device UUID")
-	daemonCmd.Flags().DurationVar(&daemonInterval, "interval", 3*time.Hour, "Sync interval")
 	daemonCmd.Flags().BoolVarP(&daemonTimeSync, "time-sync", "t", false, "Synchronize device time on each sync")
-
-	// InfluxDB flags
-	daemonCmd.Flags().StringVar(&daemonInfluxURL, "influx-url", "", "InfluxDB URL")
-	daemonCmd.Flags().StringVar(&daemonInfluxToken, "influx-token", "", "InfluxDB API token")
-	daemonCmd.Flags().StringVar(&daemonInfluxOrg, "influx-org", "", "InfluxDB organization")
-	daemonCmd.Flags().StringVar(&daemonInfluxBucket, "influx-bucket", "", "InfluxDB bucket")
+	daemonCmd.Flags().BoolVar(&daemonUseEEPROM, "eeprom", false, "Use legacy EEPROM protocol instead of standard BLE GATT")
 
 	daemonCmd.MarkFlagRequired("device")
 
@@ -88,10 +77,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Handle SIGTERM/SIGINT for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Handle SIGHUP for forced sync
-	sighupChan := make(chan os.Signal, 1)
-	signal.Notify(sighupChan, syscall.SIGHUP)
+	go func() {
+		<-sigChan
+		slog.Info("shutdown signal received, stopping daemon...")
+		cancel()
+	}()
 
 	// Get device driver
 	driver, err := device.GetDriver(daemonDeviceName)
@@ -104,134 +94,43 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		loadDaemonConfig(cfgFile)
 	}
 
-	// Setup InfluxDB if configured
-	var influxWriter *output.InfluxDBWriter
-	if daemonInfluxURL != "" {
-		if daemonInfluxToken == "" || daemonInfluxOrg == "" || daemonInfluxBucket == "" {
-			return fmt.Errorf("InfluxDB requires --influx-url, --influx-token, --influx-org, and --influx-bucket")
-		}
-
-		influxWriter = output.NewInfluxDBWriter(output.InfluxDBConfig{
-			URL:    daemonInfluxURL,
-			Token:  daemonInfluxToken,
-			Org:    daemonInfluxOrg,
-			Bucket: daemonInfluxBucket,
-		})
-		defer influxWriter.Close()
-
-		if err := influxWriter.Ping(ctx); err != nil {
-			return fmt.Errorf("failed to connect to InfluxDB: %w", err)
-		}
-		slog.Info("connected to InfluxDB", "url", daemonInfluxURL, "org", daemonInfluxOrg, "bucket", daemonInfluxBucket)
-	}
-
 	sentTracker := output.NewSentTracker()
 	cfg := driver.GetConfig()
 
-	slog.Info("starting daemon", "interval", daemonInterval, "device", cfg.Name)
-	if influxWriter != nil {
-		slog.Info("pushing to InfluxDB", "url", daemonInfluxURL)
-	}
-
-	// Force sync channel
-	forceSyncCh := make(chan struct{}, 1)
-
-	// Handle SIGHUP for forced sync
-	go func() {
-		for range sighupChan {
-			slog.Info("SIGHUP received, forcing sync...")
-			select {
-			case forceSyncCh <- struct{}{}:
-			default:
-				slog.Debug("force sync already pending")
+	// Load output backends from config
+	var backends []output.Backend
+	if cfgFile := GetConfigFile(); cfgFile != "" {
+		appCfg, err := config.Load(cfgFile)
+		if err == nil {
+			for _, outCfg := range appCfg.Outputs {
+				if !outCfg.Enabled {
+					continue
+				}
+				backend, err := output.Create(output.BackendConfig{
+					Type:     outCfg.Type,
+					Name:     outCfg.Name,
+					Enabled:  outCfg.Enabled,
+					Settings: outCfg.Settings,
+				})
+				if err != nil {
+					slog.Warn("failed to create output backend", "type", outCfg.Type, "error", err)
+					continue
+				}
+				backends = append(backends, backend)
+				slog.Info("enabled output backend", "type", outCfg.Type, "name", backend.Name())
 			}
+		}
+	}
+	// Ensure backends are closed on exit
+	defer func() {
+		for _, b := range backends {
+			b.Close()
 		}
 	}()
 
-	// Run initial sync
-	if err := runDaemonSyncOnce(ctx, driver, cfg, influxWriter, sentTracker); err != nil {
-		slog.Error("initial sync failed", "error", err)
-	}
+	slog.Info("starting daemon", "device", cfg.Name, "backends", len(backends))
 
-	// Run on interval
-	ticker := time.NewTicker(daemonInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("daemon stopped")
-			return nil
-
-		case <-sigChan:
-			slog.Info("shutdown signal received, stopping daemon...")
-			return nil
-
-		case <-ticker.C:
-			slog.Info("running scheduled sync...")
-			if err := runDaemonSyncOnce(ctx, driver, cfg, influxWriter, sentTracker); err != nil {
-				slog.Error("sync failed", "error", err)
-			}
-
-		case <-forceSyncCh:
-			slog.Info("running forced sync...")
-			if err := runDaemonSyncOnce(ctx, driver, cfg, influxWriter, sentTracker); err != nil {
-				slog.Error("forced sync failed", "error", err)
-			}
-			// Reset ticker after forced sync
-			ticker.Reset(daemonInterval)
-		}
-	}
-}
-
-func loadDaemonConfig(cfgFile string) {
-	cfg, err := config.Load(cfgFile)
-	if err != nil {
-		return
-	}
-
-	// Apply config values only if CLI flags weren't explicitly set
-	if daemonDeviceName == "" && cfg.Device.Model != "" {
-		daemonDeviceName = cfg.Device.Model
-	}
-	if daemonDeviceUUID == "" && cfg.Device.UUID != "" && cfg.Device.UUID != "auto" {
-		daemonDeviceUUID = cfg.Device.UUID
-	}
-	if cfg.Daemon.Interval > 0 {
-		daemonInterval = cfg.Daemon.Interval
-	}
-	if cfg.Daemon.TimeSync {
-		daemonTimeSync = true
-	}
-
-	// InfluxDB from config
-	for _, out := range cfg.Outputs {
-		if out.Type == "influxdb" && out.Enabled {
-			if daemonInfluxURL == "" {
-				daemonInfluxURL, _ = out.Settings["url"].(string)
-			}
-			if daemonInfluxToken == "" {
-				daemonInfluxToken, _ = out.Settings["token"].(string)
-			}
-			if daemonInfluxOrg == "" {
-				daemonInfluxOrg, _ = out.Settings["org"].(string)
-			}
-			if daemonInfluxBucket == "" {
-				daemonInfluxBucket, _ = out.Settings["bucket"].(string)
-			}
-		}
-	}
-}
-
-func runDaemonSyncOnce(ctx context.Context, driver device.Driver, cfg device.Config, influxWriter *output.InfluxDBWriter, sentTracker *output.SentTracker) error {
-	// Create auto client
-	autoClient, err := ble.NewAutoClient(IsDebugMode())
-	if err != nil {
-		return fmt.Errorf("failed to create auto client: %w", err)
-	}
-	defer autoClient.Disconnect()
-
-	// Get UUID
+	// Get target UUID
 	targetUUID := daemonDeviceUUID
 	if targetUUID == "" {
 		savedUUID, err := config.GetDeviceUUID(cfg.Name)
@@ -243,46 +142,195 @@ func runDaemonSyncOnce(ctx context.Context, driver device.Driver, cfg device.Con
 		}
 		targetUUID = savedUUID
 	}
-
 	slog.Debug("using device UUID", "uuid", targetUUID)
 
-	// Wait for Bluetooth
+	// Create AutoClient for the daemon lifetime
+	autoClient, err := ble.NewAutoClient(IsDebugMode())
+	if err != nil {
+		return fmt.Errorf("failed to create auto client: %w", err)
+	}
+	defer autoClient.Disconnect()
+
 	if err := autoClient.WaitReady(ctx); err != nil {
 		return fmt.Errorf("Bluetooth not ready: %w", err)
 	}
 
-	// Connect with timeout
-	syncTimeout := 2 * time.Minute
-	slog.Info("waiting for device...", "timeout", syncTimeout)
-	if err := autoClient.ConnectByUUID(ctx, targetUUID, syncTimeout); err != nil {
-		return fmt.Errorf("connection failed: %w", err)
+	slog.Info("daemon ready")
+
+	// Use GATT protocol by default, EEPROM only if explicitly requested
+	if !daemonUseEEPROM {
+		return runGATTDaemonLoop(ctx, autoClient, driver, cfg, targetUUID, sentTracker, backends)
 	}
 
-	// Discover services
+	// Legacy EEPROM protocol (only when --eeprom flag is used)
+	// Track last synced sequence number (for active scan) and use cooldown (for passive)
+	var lastSyncedSeqNum uint16
+	var lastEmptySyncTime time.Time
+	const cooldownAfterEmptySync = 60 * time.Second
+
+	for {
+		// Check if we're in cooldown period (recently synced with no new data)
+		if !lastEmptySyncTime.IsZero() {
+			elapsed := time.Since(lastEmptySyncTime)
+			if elapsed < cooldownAfterEmptySync {
+				remaining := cooldownAfterEmptySync - elapsed
+				slog.Info("cooldown period (no new data last sync), waiting...", "remaining", remaining.Round(time.Second))
+				select {
+				case <-time.After(remaining):
+				case <-ctx.Done():
+					slog.Info("daemon stopped")
+					return nil
+				}
+				lastEmptySyncTime = time.Time{} // Reset cooldown
+			}
+		}
+
+		// Passive wait for device to connect (user presses Bluetooth button or takes measurement)
+		slog.Info("waiting for device... (press Bluetooth button or take a measurement)")
+		connErr := autoClient.ConnectByUUID(ctx, targetUUID, 0)
+
+		if connErr != nil {
+			if ctx.Err() != nil {
+				slog.Info("daemon stopped")
+				return nil
+			}
+			slog.Error("connection failed", "error", connErr)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Check advertisement data if available (only works with active scanning)
+		advData := autoClient.GetLastAdvData()
+		if advData.Valid {
+			slog.Debug("advertisement data", "seqNum", advData.SequenceNumber, "records", advData.RecordsNumber, "pairing", advData.PairingMode)
+
+			// Skip if sequence number hasn't changed (no new records)
+			if advData.SequenceNumber == lastSyncedSeqNum && lastSyncedSeqNum != 0 {
+				slog.Info("no new records (seqNum unchanged), skipping sync", "seqNum", advData.SequenceNumber)
+				autoClient.Disconnect()
+				lastEmptySyncTime = time.Now()
+				continue
+			}
+		}
+
+		slog.Info("device connected")
+
+		// Run connected session - sync records
+		foundNewRecords := runConnectedLoop(ctx, autoClient, driver, cfg, sentTracker, backends)
+
+		if ctx.Err() != nil {
+			slog.Info("daemon stopped")
+			return nil
+		}
+
+		// Update tracking state
+		if advData.Valid {
+			lastSyncedSeqNum = advData.SequenceNumber
+		}
+
+		if foundNewRecords {
+			slog.Info("sync done, found new records")
+			lastEmptySyncTime = time.Time{} // Clear cooldown
+		} else {
+			slog.Info("sync done, no new data - entering cooldown")
+			lastEmptySyncTime = time.Now() // Start cooldown
+		}
+
+		// Brief pause for device to disconnect
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// runConnectedLoop handles a single device connection session.
+// The Omron device disconnects itself ~3 seconds after EndTransmission - this is
+// expected firmware behavior, not a bug. There is no "idle but connected" state.
+// Returns true if new records were found and synced.
+func runConnectedLoop(ctx context.Context, autoClient *ble.AutoClient, driver device.Driver, cfg device.Config, sentTracker *output.SentTracker, backends []output.Backend) bool {
+	// Setup: discover services and setup notifications
+	handler, err := setupConnection(ctx, autoClient)
+	if err != nil {
+		slog.Error("failed to setup connection", "error", err)
+		autoClient.Disconnect() // Clean up connection state
+		return false
+	}
+
+	// Perform sync
+	newRecords, err := performSync(ctx, handler, driver, cfg, sentTracker, backends)
+
+	// Always disconnect to ensure clean state for next connection
+	autoClient.Disconnect()
+
+	if err != nil {
+		slog.Error("sync failed", "error", err)
+		return false
+	}
+
+	return newRecords > 0
+}
+
+// setupConnection performs one-time BLE setup: discover services and enable notifications
+func setupConnection(ctx context.Context, autoClient *ble.AutoClient) (*ble.AutoTxRxHandler, error) {
+	slog.Debug("discovering services...")
 	if err := autoClient.DiscoverOmronServices(ctx); err != nil {
-		return fmt.Errorf("service discovery failed: %w", err)
+		return nil, fmt.Errorf("service discovery failed: %w", err)
 	}
 
-	// Setup handler
 	handler := ble.NewAutoTxRxHandler(autoClient, IsDebugMode())
+
+	slog.Debug("setting up notifications...")
 	if err := handler.SetupNotifications(); err != nil {
-		return fmt.Errorf("failed to setup notifications: %w", err)
+		return nil, fmt.Errorf("failed to setup notifications: %w", err)
 	}
 
-	// Wait for stabilization
-	time.Sleep(10 * time.Second)
-
-	// Unlock
-	if err := handler.UnlockWithKey(ctx, nil); err != nil {
-		return fmt.Errorf("failed to unlock device: %w", err)
+	// Wait for connection to stabilize
+	slog.Debug("waiting for connection to stabilize...")
+	select {
+	case <-time.After(10 * time.Second):
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
-	// Start transmission
-	if err := handler.StartTransmission(ctx); err != nil {
-		return fmt.Errorf("failed to start transmission: %w", err)
+	return handler, nil
+}
+
+// performSync does a complete sync cycle: unlock -> start transmission -> read -> end transmission.
+// After EndTransmission, the device will disconnect itself in ~3 seconds (Omron firmware behavior).
+// Returns the number of new records synced and any error.
+func performSync(ctx context.Context, handler *ble.AutoTxRxHandler, driver device.Driver, cfg device.Config, sentTracker *output.SentTracker, backends []output.Backend) (int, error) {
+	// Enter transmission mode
+	slog.Debug("unlocking device...")
+	if err := unlockWithRetry(ctx, handler); err != nil {
+		return 0, fmt.Errorf("unlock failed: %w", err)
 	}
 
-	// Time sync
+	slog.Debug("starting transmission mode...")
+	if err := startTransmissionWithRetry(ctx, handler); err != nil {
+		return 0, fmt.Errorf("start transmission failed: %w", err)
+	}
+
+	// Read records
+	slog.Info("reading records...")
+	newCount, err := readAndPushRecords(ctx, handler, driver, cfg, sentTracker, backends)
+
+	// Always end transmission to let device go idle, even if read failed
+	slog.Debug("ending transmission mode...")
+	if endErr := handler.EndTransmission(ctx); endErr != nil {
+		slog.Warn("end transmission failed", "error", endErr)
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	slog.Info("sync completed", "new_records", newCount)
+	return newCount, nil
+}
+
+
+// readAndPushRecords reads records from device (assumes session already established)
+// Returns the number of new records pushed and any error.
+func readAndPushRecords(ctx context.Context, handler *ble.AutoTxRxHandler, driver device.Driver, cfg device.Config, sentTracker *output.SentTracker, backends []output.Backend) (int, error) {
+	// Time sync (optional)
 	if daemonTimeSync {
 		settingsSize := int(cfg.SettingsWriteAddress - cfg.SettingsReadAddress)
 		cachedSettings, err := handler.ReadEEPROM(ctx, cfg.SettingsReadAddress, settingsSize, cfg.TransmissionBlockSize)
@@ -301,23 +349,18 @@ func runDaemonSyncOnce(ctx context.Context, driver device.Driver, cfg device.Con
 	totalSize := cfg.RecordsPerUser[0] * cfg.RecordByteSize
 	recordData, err := handler.ReadEEPROM(ctx, cfg.UserStartAddresses[0], totalSize, cfg.TransmissionBlockSize)
 	if err != nil {
-		handler.EndTransmission(ctx)
-		return fmt.Errorf("failed to read records: %w", err)
+		return 0, fmt.Errorf("failed to read records: %w", err)
 	}
 
-	handler.EndTransmission(ctx)
-
-	// Parse records
+	// Parse and push records
 	records := parseRecordsFromData(recordData, driver, cfg)
 	slog.Info("read records from device", "count", len(records))
 
 	if len(records) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	allRecords := [][]device.BloodPressureRecord{records}
-
-	// Filter to only new records
 	newRecords := sentTracker.FilterNewRecords(allRecords)
 	newCount := 0
 	for _, userRecords := range newRecords {
@@ -326,26 +369,273 @@ func runDaemonSyncOnce(ctx context.Context, driver device.Driver, cfg device.Con
 
 	if newCount == 0 {
 		slog.Info("no new records to push")
-		return nil
+		return 0, nil
 	}
 
 	slog.Info("found new records", "count", newCount)
 
-	// Push to InfluxDB
-	if influxWriter != nil {
-		if err := influxWriter.WriteRecords(ctx, newRecords, cfg.Name); err != nil {
-			return fmt.Errorf("failed to write to InfluxDB: %w", err)
+	// Write to all configured backends
+	metadata := output.Metadata{
+		DeviceName:    cfg.Name,
+		SyncTimestamp: time.Now(),
+		IsFullSync:    true,
+	}
+
+	// Convert to output.Record format
+	var outputRecords [][]output.Record
+	for _, userRecords := range newRecords {
+		var userOutputRecords []output.Record
+		for _, r := range userRecords {
+			userOutputRecords = append(userOutputRecords, output.Record(r))
 		}
-		slog.Info("pushed records to InfluxDB", "count", newCount)
+		outputRecords = append(outputRecords, userOutputRecords)
 	}
 
-	// Write to CSV
-	if err := output.WriteCSV(allRecords); err != nil {
-		slog.Warn("failed to write CSV", "error", err)
+	for _, backend := range backends {
+		if err := backend.Write(ctx, outputRecords, metadata); err != nil {
+			slog.Warn("failed to write to backend", "backend", backend.Name(), "error", err)
+		} else {
+			slog.Debug("wrote to backend", "backend", backend.Name(), "count", newCount)
+		}
 	}
 
-	// Update tracker
 	sentTracker.UpdateLastSent(newRecords)
+	return newCount, nil
+}
 
-	return nil
+func loadDaemonConfig(cfgFile string) {
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		return
+	}
+
+	// Apply config values only if CLI flags weren't explicitly set
+	if daemonDeviceName == "" && cfg.Device.Model != "" {
+		daemonDeviceName = cfg.Device.Model
+	}
+	if daemonDeviceUUID == "" && cfg.Device.UUID != "" && cfg.Device.UUID != "auto" {
+		daemonDeviceUUID = cfg.Device.UUID
+	}
+	if cfg.Daemon.TimeSync {
+		daemonTimeSync = true
+	}
+}
+
+// runGATTDaemonLoop runs the daemon using standard BLE GATT protocol.
+// This approach is simpler than EEPROM:
+// 1. Connect to device
+// 2. Discover GATT services (Blood Pressure, Current Time, Battery)
+// 3. Enable notifications
+// 4. Sync time (device expects this)
+// 5. Wait for measurements via notifications
+// 6. Device disconnects itself after sending data
+func runGATTDaemonLoop(ctx context.Context, autoClient *ble.AutoClient, driver device.Driver, cfg device.Config, targetUUID string, sentTracker *output.SentTracker, backends []output.Backend) error {
+	slog.Info("using standard BLE GATT protocol")
+
+	for {
+		// Wait for device to connect
+		slog.Info("waiting for device... (press Bluetooth button or take a measurement)")
+		connErr := autoClient.ConnectByUUID(ctx, targetUUID, 0)
+
+		if connErr != nil {
+			if ctx.Err() != nil {
+				slog.Info("daemon stopped")
+				return nil
+			}
+			slog.Error("connection failed", "error", connErr)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		slog.Info("device connected, discovering GATT services...")
+
+		// Run GATT session
+		newRecords := runGATTSession(ctx, autoClient, driver, cfg, sentTracker, backends)
+
+		if ctx.Err() != nil {
+			slog.Info("daemon stopped")
+			return nil
+		}
+
+		if newRecords > 0 {
+			slog.Info("sync done", "new_records", newRecords)
+		} else {
+			slog.Info("sync done, no new data")
+		}
+
+		// Wait for device to disconnect (Omron devices disconnect themselves)
+		autoClient.WaitForDisconnect(ctx, 10*time.Second)
+		autoClient.Disconnect() // Ensure cleanup
+
+		// Brief pause before waiting for next connection
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// runGATTSession handles a single GATT connection session.
+// Returns the number of new records synced.
+func runGATTSession(ctx context.Context, autoClient *ble.AutoClient, driver device.Driver, cfg device.Config, sentTracker *output.SentTracker, backends []output.Backend) int {
+	// Clear any previous measurements
+	autoClient.ClearCollectedMeasurements()
+
+	// Track battery level
+	var batteryLevel *uint8
+
+	// Discover GATT services
+	if err := autoClient.DiscoverGATTServices(ctx); err != nil {
+		slog.Error("failed to discover GATT services", "error", err)
+		autoClient.Disconnect()
+		return 0
+	}
+
+	if !autoClient.HasGATTBloodPressureService() {
+		slog.Error("Blood Pressure Service not found on device")
+		autoClient.Disconnect()
+		return 0
+	}
+
+	slog.Debug("GATT services discovered")
+
+	// Enable notifications - this is key for receiving measurements
+	if err := autoClient.EnableGATTNotifications(); err != nil {
+		slog.Error("failed to enable GATT notifications", "error", err)
+		autoClient.Disconnect()
+		return 0
+	}
+
+	slog.Debug("GATT notifications enabled")
+
+	// Sync time - Omron devices expect this on every connection
+	// The device will start sending measurements after time sync
+	if err := autoClient.SyncCurrentTime(); err != nil {
+		slog.Warn("time sync failed", "error", err)
+		// Continue anyway, device might still send measurements
+	} else {
+		slog.Debug("time synchronized")
+	}
+
+	// Wait for measurements via notifications
+	// Omron devices send all stored measurements automatically after time sync
+	slog.Info("waiting for measurements...")
+
+	// Wait with timeout for measurements
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+
+	// Also wait for disconnect signal
+	measurementsDone := false
+	lastMeasurementTime := time.Now()
+
+	for !measurementsDone {
+		select {
+		case measurement := <-autoClient.GetBPMeasurementChannel():
+			lastMeasurementTime = time.Now()
+			slog.Info("received measurement",
+				"systolic", int(measurement.Systolic),
+				"diastolic", int(measurement.Diastolic),
+				"pulse", int(measurement.PulseRate),
+				"timestamp", measurement.Timestamp)
+
+			// Reset timeout - more measurements might come
+			timeout.Reset(5 * time.Second)
+
+		case level := <-autoClient.GetBatteryLevelChannel():
+			batteryLevel = &level
+			slog.Info("battery level", "percent", level)
+
+		case <-timeout.C:
+			// Timeout - check if we received any measurements recently
+			if time.Since(lastMeasurementTime) > 5*time.Second {
+				measurementsDone = true
+			}
+
+		case <-ctx.Done():
+			return 0
+		}
+	}
+
+	// Get all collected measurements
+	gattMeasurements := autoClient.GetCollectedMeasurements()
+	if len(gattMeasurements) == 0 {
+		slog.Info("no measurements received")
+		return 0
+	}
+
+	slog.Info("received measurements from device", "count", len(gattMeasurements))
+
+	// Convert GATT measurements to device records
+	records := convertGATTMeasurements(gattMeasurements, cfg)
+
+	// Filter for new records
+	allRecords := [][]device.BloodPressureRecord{records}
+	newRecords := sentTracker.FilterNewRecords(allRecords)
+	newCount := 0
+	for _, userRecords := range newRecords {
+		newCount += len(userRecords)
+	}
+
+	if newCount == 0 {
+		slog.Info("no new records to push")
+		return 0
+	}
+
+	slog.Info("found new records", "count", newCount)
+
+	// Write to backends
+	metadata := output.Metadata{
+		DeviceName:    cfg.Name,
+		SyncTimestamp: time.Now(),
+		IsFullSync:    true,
+		BatteryLevel:  batteryLevel,
+	}
+
+	var outputRecords [][]output.Record
+	for _, userRecords := range newRecords {
+		var userOutputRecords []output.Record
+		for _, r := range userRecords {
+			userOutputRecords = append(userOutputRecords, output.Record(r))
+		}
+		outputRecords = append(outputRecords, userOutputRecords)
+	}
+
+	for _, backend := range backends {
+		if err := backend.Write(ctx, outputRecords, metadata); err != nil {
+			slog.Warn("failed to write to backend", "backend", backend.Name(), "error", err)
+		} else {
+			slog.Debug("wrote to backend", "backend", backend.Name(), "count", newCount)
+		}
+	}
+
+	sentTracker.UpdateLastSent(newRecords)
+	return newCount
+}
+
+// convertGATTMeasurements converts GATT measurements to device records
+func convertGATTMeasurements(gattMeasurements []*ble.GATTBloodPressureMeasurement, cfg device.Config) []device.BloodPressureRecord {
+	records := make([]device.BloodPressureRecord, 0, len(gattMeasurements))
+
+	for _, m := range gattMeasurements {
+		record := device.BloodPressureRecord{
+			Systolic:  int(m.Systolic),
+			Diastolic: int(m.Diastolic),
+			Pulse:     int(m.PulseRate),
+			Timestamp: m.Timestamp,
+			Movement:  m.BodyMovement,
+			IHB:       m.IrregularPulse,
+		}
+
+		// Skip invalid records
+		if record.Systolic == 0 || record.Diastolic == 0 {
+			continue
+		}
+
+		// Use sync time if no timestamp
+		if record.Timestamp.IsZero() {
+			record.Timestamp = time.Now()
+		}
+
+		records = append(records, record)
+	}
+
+	return records
 }

@@ -37,6 +37,12 @@ type PrometheusBackend struct {
 	// Counter for total syncs
 	syncCounter *prometheus.CounterVec
 
+	// Gauge for last sync timestamp
+	lastSyncGauge *prometheus.GaugeVec
+
+	// Gauge for battery level
+	batteryGauge *prometheus.GaugeVec
+
 	mu sync.RWMutex
 }
 
@@ -128,6 +134,24 @@ func NewPrometheusBackend(name string, config PrometheusBackendConfig) (*Prometh
 		[]string{"device", "status"},
 	)
 
+	lastSyncGauge := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: config.Namespace,
+			Name:      "last_sync_timestamp_seconds",
+			Help:      "Unix timestamp of the last successful sync",
+		},
+		[]string{"device"},
+	)
+
+	batteryGauge := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: config.Namespace,
+			Name:      "battery_level_percent",
+			Help:      "Device battery level in percent",
+		},
+		[]string{"device"},
+	)
+
 	// Register all metrics
 	registry.MustRegister(systolicGauge)
 	registry.MustRegister(diastolicGauge)
@@ -136,6 +160,8 @@ func NewPrometheusBackend(name string, config PrometheusBackendConfig) (*Prometh
 	registry.MustRegister(ihbGauge)
 	registry.MustRegister(timestampGauge)
 	registry.MustRegister(syncCounter)
+	registry.MustRegister(lastSyncGauge)
+	registry.MustRegister(batteryGauge)
 
 	backend := &PrometheusBackend{
 		name:           name,
@@ -148,6 +174,8 @@ func NewPrometheusBackend(name string, config PrometheusBackendConfig) (*Prometh
 		ihbGauge:       ihbGauge,
 		timestampGauge: timestampGauge,
 		syncCounter:    syncCounter,
+		lastSyncGauge:  lastSyncGauge,
+		batteryGauge:   batteryGauge,
 	}
 
 	// Start HTTP server for metrics
@@ -243,8 +271,14 @@ func (b *PrometheusBackend) Write(ctx context.Context, userRecords [][]Record, m
 		b.ihbGauge.WithLabelValues(device, user).Set(ihb)
 	}
 
-	// Increment sync counter
+	// Increment sync counter and update last sync timestamp
 	b.syncCounter.WithLabelValues(device, "success").Inc()
+	b.lastSyncGauge.WithLabelValues(device).Set(float64(time.Now().Unix()))
+
+	// Update battery level if available
+	if metadata.BatteryLevel != nil {
+		b.batteryGauge.WithLabelValues(device).Set(float64(*metadata.BatteryLevel))
+	}
 
 	return nil
 }
